@@ -11,6 +11,7 @@ using Memento
 using Memento.TestUtils
 using OffsetArrays
 using Random
+using SQLStrings
 using TimeZones
 using Tables
 
@@ -1458,6 +1459,35 @@ end
             end
 
             close(conn)
+        end
+
+        @testset "SQLString" begin
+            conn = LibPQ.Connection(CONNECTION_STRING)
+
+            execute(conn, sql```
+               CREATE TEMPORARY TABLE libpq_test_users (
+                   id integer primary key,
+                   name text
+               )```)
+            # The canonical SQL injection https://xkcd.com/327/
+            for (id,name) in [(1,"Foo"), (2, "Robert'); DROP TABLE libpq_test_users; --")]
+                execute(conn, sql```
+                        INSERT INTO libpq_test_users
+                        VALUES ( $id, $name )
+                        ```)
+            end
+            result = execute(conn, sql`SELECT * from libpq_test_users where id = 2`)
+            @test first(result).name == "Robert'); DROP TABLE libpq_test_users; --"
+
+            # Splatting example
+            user = (3,"Bar")
+            execute(conn, sql```
+                    INSERT INTO libpq_test_users
+                    VALUES ( $(user...) )
+                    ```)
+            bar_id = 3
+            result = execute(conn, sql`SELECT * from libpq_test_users where id = $bar_id`)
+            @test first(result).name == "Bar"
         end
 
         @testset "Query Errors" begin
