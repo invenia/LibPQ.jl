@@ -1,7 +1,7 @@
 module LibPQ
 
-export status, reset!, execute, prepare, async_execute, cancel,
-    num_columns, num_rows, num_params, num_affected_rows
+export status, reset!, execute, execute_params, prepare, async_execute,
+    async_execute_params, cancel, num_columns, num_rows, num_params, num_affected_rows
 
 
 using Base: Semaphore, acquire, release
@@ -82,6 +82,9 @@ Adding conversions to this constant will override the default conversions for al
 LibPQ.jl.
 """
 const LIBPQ_CONVERSIONS = PQConversions()
+
+const BINARY = true
+const TEXT = false
 
 include("connections.jl")
 include("results.jl")

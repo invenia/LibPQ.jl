@@ -1,5 +1,5 @@
 "A result from a PostgreSQL database query"
-mutable struct Result
+mutable struct Result{BinaryFormat}
     "A pointer to a libpq PGresult object (C_NULL if cleared)"
     result::Ptr{libpq_c.PGresult}
 
@@ -21,22 +21,21 @@ mutable struct Result
     "Name of each column in the result"
     column_names::Vector{String}
 
+    type_lookup::LayerDict
+
     # TODO: attach encoding per https://wiki.postgresql.org/wiki/Driver_development#Result_object_and_client_encoding
-    function Result(
+    function Result{BinaryFormat}(
         result::Ptr{libpq_c.PGresult},
         jl_conn::Connection;
-        column_types::Union{AbstractDict, AbstractVector}=ColumnTypeMap(),
+        column_types::Union{AbstractDict,AbstractVector}=ColumnTypeMap(),
         type_map::AbstractDict=PQTypeMap(),
         conversions::AbstractDict=PQConversions(),
         not_null=false,
-    )
-        jl_result = new(result, Atomic{Bool}(result == C_NULL))
+    ) where {BinaryFormat}
+        jl_result = new{BinaryFormat}(result, Atomic{Bool}(result == C_NULL))
 
-        type_lookup = LayerDict(
-            PQTypeMap(type_map),
-            jl_conn.type_map,
-            LIBPQ_TYPE_MAP,
-            _DEFAULT_TYPE_MAP,
+        jl_result.type_lookup = LayerDict(
+            PQTypeMap(type_map), jl_conn.type_map, LIBPQ_TYPE_MAP, _DEFAULT_TYPE_MAP
         )
 
         func_lookup = LayerDict(
@@ -47,9 +46,10 @@ mutable struct Result
             _FALLBACK_CONVERSION,
         )
 
-        jl_result.column_oids = col_oids = map(1:num_columns(jl_result)) do col_num
-            libpq_c.PQftype(jl_result.result, col_num - 1)
-        end
+        jl_result.column_oids =
+            col_oids = map(1:num_columns(jl_result)) do col_num
+                libpq_c.PQftype(jl_result.result, col_num - 1)
+            end
 
         jl_result.column_names = map(1:num_columns(jl_result)) do col_num
             unsafe_string(libpq_c.PQfname(jl_result.result, col_num - 1))
@@ -60,16 +60,23 @@ mutable struct Result
             column_type_map[column_number(jl_result, k)] = v
         end
 
-        jl_result.column_types = col_types = collect(Type, imap(enumerate(col_oids)) do itr
-            col_num, col_oid = itr
-            get(column_type_map, col_num) do
-                get(type_lookup, col_oid, String)
-            end
-        end)
+        jl_result.column_types =
+            col_types = collect(
+                Type,
+                imap(enumerate(col_oids)) do itr
+                    col_num, col_oid = itr
+                    get(column_type_map, col_num) do
+                        get(jl_result.type_lookup, col_oid, String)
+                    end
+                end,
+            )
 
-        jl_result.column_funcs = collect(Base.Callable, imap(col_oids, col_types) do oid, typ
-            func_lookup[(oid, typ)]
-        end)
+        jl_result.column_funcs = collect(
+            Base.Callable,
+            imap(col_oids, col_types) do oid, typ
+                func_lookup[(oid, typ)]
+            end,
+        )
 
         # figure out which columns the user says may contain nulls
         if not_null isa Bool
@@ -77,9 +84,11 @@ mutable struct Result
         elseif not_null isa AbstractArray
             if eltype(not_null) === Bool
                 if length(not_null) != length(col_types)
-                    throw(ArgumentError(
-                        "The length of keyword argument not_null, when an array, must be equal to the number of columns"
-                    ))
+                    throw(
+                        ArgumentError(
+                            "The length of keyword argument not_null, when an array, must be equal to the number of columns",
+                        ),
+                    )
                 end
 
                 jl_result.not_null = not_null
@@ -95,15 +104,35 @@ mutable struct Result
                 end
             end
         else
-            throw(ArgumentError(
-                "Unsupported type $(typeof(not_null)) for keyword argument not_null"
-            ))
+            throw(
+                ArgumentError(
+                    "Unsupported type $(typeof(not_null)) for keyword argument not_null"
+                ),
+            )
         end
 
         finalizer(close, jl_result)
 
         return jl_result
     end
+end
+
+function Result(
+    result::Ptr{libpq_c.PGresult},
+    jl_conn::Connection;
+    column_types::Union{AbstractDict,AbstractVector}=ColumnTypeMap(),
+    type_map::AbstractDict=PQTypeMap(),
+    conversions::AbstractDict=PQConversions(),
+    not_null=false,
+)
+    return Result{TEXT}(
+        result,
+        jl_conn;
+        column_types=column_types,
+        type_map=type_map,
+        conversions=conversions,
+        not_null=not_null,
+    )
 end
 
 """
@@ -146,15 +175,16 @@ end
 
 function _verbose_error_message(jl_result::Result)
     msg_ptr = libpq_c.PQresultVerboseErrorMessage(
-        jl_result.result,
-        libpq_c.PQERRORS_VERBOSE,
-        libpq_c.PQSHOW_CONTEXT_ALWAYS,
+        jl_result.result, libpq_c.PQERRORS_VERBOSE, libpq_c.PQSHOW_CONTEXT_ALWAYS
     )
 
     if msg_ptr == C_NULL
-        error(LOGGER, Errors.JLResultError(
-            "libpq could not allocate memory for the result error message"
-        ))
+        error(
+            LOGGER,
+            Errors.JLResultError(
+                "libpq could not allocate memory for the result error message"
+            ),
+        )
     end
 
     msg = unsafe_string(msg_ptr)
@@ -179,7 +209,7 @@ julia> LibPQ.error_field(result, LibPQ.libpq_c.PG_DIAG_SEVERITY)
 "ERROR"
 ```
 """
-function error_field(jl_result::Result, field_code::Union{Char, Integer})
+function error_field(jl_result::Result, field_code::Union{Char,Integer})
     ret = libpq_c.PQresultErrorField(jl_result.result, field_code)
     return ret == C_NULL ? nothing : unsafe_string(ret)
 end
@@ -243,7 +273,6 @@ end
 """
     execute(
         {jl_conn::Connection, query::AbstractString | stmt::Statement},
-        [parameters::Union{AbstractVector, Tuple},]
         throw_error::Bool=true,
         column_types::AbstractDict=ColumnTypeMap(),
         type_map::AbstractDict=LibPQ.PQTypeMap(),
@@ -257,21 +286,17 @@ fatal error or unreadable response.
 The query may be passed as `Connection` and `AbstractString` (SQL) arguments, or as a
 `Statement`.
 
-`execute` optionally takes a `parameters` vector which passes query parameters as strings to
-PostgreSQL.
-
 `column_types` accepts type overrides for columns in the result which take priority over
 those in `type_map`.
 For information on the `column_types`, `type_map`, and `conversions` arguments, see
 [Type Conversions](@ref typeconv).
+
+Also see `execute_params`.
 """
 function execute end
 
 function execute(
-    jl_conn::Connection,
-    query::AbstractString;
-    throw_error::Bool=true,
-    kwargs...
+    jl_conn::Connection, query::AbstractString; throw_error::Bool=true, kwargs...
 )
     result = lock(jl_conn) do
         _execute(jl_conn.conn, query)
@@ -280,21 +305,55 @@ function execute(
     return handle_result(Result(result, jl_conn; kwargs...); throw_error=throw_error)
 end
 
-function execute(
+"""
+    execute_params(
+        {jl_conn::Connection, query::AbstractString | stmt::Statement},
+        [parameters::Union{AbstractVector, Tuple},]
+        throw_error::Bool=true,
+        binary_format::Bool=TEXT,
+        column_types::AbstractDict=ColumnTypeMap(),
+        type_map::AbstractDict=LibPQ.PQTypeMap(),
+        conversions::AbstractDict=LibPQ.PQConversions(),
+    ) -> Result
+
+Run a query on the PostgreSQL database and return a `Result`.
+If `throw_error` is `true`, throw an error and clear the result if the query results in a
+fatal error or unreadable response.
+If `binary_format` is `BINARY`, the results data will be in binary and not string format.
+
+The query may be passed as `Connection` and `AbstractString` (SQL) arguments, or as a
+`Statement`.
+
+`execute_params` optionally takes a `parameters` vector which passes query parameters as
+strings to PostgreSQL.
+
+`column_types` accepts type overrides for columns in the result which take priority over
+those in `type_map`.
+For information on the `column_types`, `type_map`, and `conversions` arguments, see
+[Type Conversions](@ref typeconv).
+
+Also see `execute`.
+"""
+function execute_params end
+
+function execute_params(
     jl_conn::Connection,
     query::AbstractString,
-    parameters::Union{AbstractVector, Tuple};
+    parameters::Union{AbstractVector,Tuple}=[];
     throw_error::Bool=true,
-    kwargs...
+    binary_format::Bool=TEXT,
+    kwargs...,
 )
     string_params = string_parameters(parameters)
     pointer_params = parameter_pointers(string_params)
 
     result = lock(jl_conn) do
-        _execute(jl_conn.conn, query, pointer_params)
+        _execute(jl_conn.conn, query, pointer_params; binary_format=binary_format)
     end
 
-    return handle_result(Result(result, jl_conn; kwargs...); throw_error=throw_error)
+    return handle_result(
+        Result{binary_format}(result, jl_conn; kwargs...); throw_error=throw_error
+    )
 end
 
 function _execute(conn_ptr::Ptr{libpq_c.PGconn}, query::AbstractString)
@@ -304,7 +363,8 @@ end
 function _execute(
     conn_ptr::Ptr{libpq_c.PGconn},
     query::AbstractString,
-    parameters::Vector{Ptr{UInt8}},
+    parameters::Vector{Ptr{UInt8}};
+    binary_format::Bool=TEXT,
 )
     num_params = length(parameters)
 
@@ -316,7 +376,7 @@ function _execute(
         parameters,
         C_NULL,  # paramLengths is ignored for text format parameters
         zeros(Cint, num_params),  # all parameters in text format
-        zero(Cint),  # return result in text format
+        Cint(binary_format),  # return result in text format
     )
 end
 
@@ -337,11 +397,11 @@ string_parameters(parameters::AbstractVector) = map(string_parameter, parameters
 
 # vector which might contain missings
 function string_parameters(parameters::AbstractVector{>:Missing})
-    collect(
-        Union{String, Missing},
+    return collect(
+        Union{String,Missing},
         imap(parameters) do parameter
             ismissing(parameter) ? missing : string_parameter(parameter)
-        end
+        end,
     )
 end
 
@@ -352,13 +412,12 @@ function string_parameter(parameter::AbstractVector)
     print(io, "{")
     join(io, (_array_element(el) for el in parameter), ",")
     print(io, "}")
-    String(take!(io))
+    return String(take!(io))
 end
 
 _array_element(el::AbstractString) = "\"$el\""
 _array_element(el::Missing) = "NULL"
 _array_element(el) = string_parameter(el)
-
 
 function string_parameter(interval::AbstractInterval)
     io = IOBuffer()
@@ -403,7 +462,7 @@ If this result did not come from the description of a prepared statement, return
 """
 function num_params(jl_result::Result)::Int
     # todo: check cleared?
-    libpq_c.PQnparams(jl_result.result)
+    return libpq_c.PQnparams(jl_result.result)
 end
 
 """
@@ -414,7 +473,7 @@ This will be 0 if the query would never return data.
 """
 function num_rows(jl_result::Result)::Int
     # todo: check cleared?
-    libpq_c.PQntuples(jl_result.result)
+    return libpq_c.PQntuples(jl_result.result)
 end
 
 """
@@ -443,7 +502,7 @@ This will be 0 if the query would never return data.
 """
 function num_columns(jl_result::Result)::Int
     # todo: check cleared?
-    libpq_c.PQnfields(jl_result.result)
+    return libpq_c.PQnfields(jl_result.result)
 end
 
 """
@@ -467,7 +526,7 @@ column_names(jl_result::Result) = copy(jl_result.column_names)
 
 Return the index (1-based) of the column named `column_name`.
 """
-function column_number(jl_result::Result, column_name::Union{AbstractString, Symbol})::Int
+function column_number(jl_result::Result, column_name::Union{AbstractString,Symbol})::Int
     return something(findfirst(isequal(String(column_name)), jl_result.column_names), 0)
 end
 
